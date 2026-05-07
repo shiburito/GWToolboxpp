@@ -30,6 +30,7 @@ public:
         time_t system_time = 0;
         IDirect3DTexture9** icon = 0;
         wchar_t* item_name_enc = 0;
+        wchar_t* source_name_enc = nullptr;
         GW::Constants::MapID map_id = GW::Constants::MapID::None;
 
         // ModelFileID is the unique skin identifier; useful when one display
@@ -51,6 +52,7 @@ public:
         GW::Constants::DamageType damage_type = GW::Constants::DamageType::None;
         GW::Constants::AttributeByte requirement_attribute = GW::Constants::AttributeByte::None;
         bool hard_mode = false;
+        bool favor_active = false;
 
         PendingDrop(GW::Item*);
         ~PendingDrop();
@@ -58,7 +60,7 @@ public:
         static const wchar_t* GetCSVHeader();
         GuiUtils::EncString* GetItemName();
     };
-    static_assert(sizeof(PendingDrop) == 48);
+    static_assert(sizeof(PendingDrop) == 56);
 
     std::vector<PendingDrop*>& GetDropHistory();
     int GetTotalGoldValue();

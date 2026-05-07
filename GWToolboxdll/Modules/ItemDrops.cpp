@@ -11,7 +11,7 @@
 #include <GWCA/Managers/ItemMgr.h>
 #include <GWCA/Managers/PartyMgr.h>
 #include <GWCA/Managers/MapMgr.h>
-
+#include <GWCA/Managers/UIMgr.h>
 #include <GWCA/Packets/StoC.h>
 
 #include <Utils/GuiUtils.h>
@@ -19,8 +19,10 @@
 
 #include <Modules/ItemDrops.h>
 #include <Modules/Resources.h>
+#include <Widgets/FavorTracker.h>
 #include <Timer.h>
 #include <Utils/TextUtils.h>
+#include <RestClient.h>
 
 #define LOAD_BOOL(var) var = ini->GetBoolValue(Name(), #var, var);
 #define SAVE_BOOL(var) ini->SetBoolValue(Name(), #var, var);
@@ -64,14 +66,24 @@ namespace {
     bool hide_party_gold = false;
     bool hide_party_green = false;
     bool track_drops = false;
+    std::string api_url{};
+    std::vector<AsyncRestClient*> pending_api_requests{};
     std::map<ItemModelID, std::string> dont_hide_for_player{};
     std::map<ItemModelID, std::string> dont_hide_for_party{};
 
     void OnAgentAdd(GW::HookStatus*, const GW::Packet::StoC::AgentAdd*);
     void OnAgentRemove(GW::HookStatus*, GW::Packet::StoC::AgentRemove*);
+    void OnAgentState(GW::HookStatus*, GW::Packet::StoC::AgentState*);
     void OnMapLoad(GW::HookStatus*, GW::Packet::StoC::MapLoaded*);
     void OnItemReuseId(GW::HookStatus*, GW::Packet::StoC::ItemGeneral_ReuseID*);
     void OnItemUpdateOwner(GW::HookStatus*, GW::Packet::StoC::ItemUpdateOwner*);
+
+    struct RecentSourceAgent {
+        GW::GamePos position;
+        wchar_t* enc_name;
+        clock_t time;
+    };
+    std::vector<RecentSourceAgent> recent_source_agents{};
 
     GW::HookEntry ChatCmd_HookEntry;
     GW::HookEntry OnAgentAdd_Entry;
@@ -79,6 +91,10 @@ namespace {
     GW::HookEntry OnMapLoad_Entry;
     GW::HookEntry OnItemReuseId_Entry;
     GW::HookEntry OnItemUpdateOwner_Entry;
+    GW::HookEntry OnAgentState_Entry;
+    GW::HookEntry OnInventorySlotCleared_Entry;
+
+    std::unordered_set<uint32_t> recently_player_dropped;
 
 
     using namespace GW::Constants::ItemID;
@@ -304,6 +320,78 @@ namespace {
     {
         pending_write_to_csv.push_back(item);
     }
+
+    void PostDropsToApi(const std::vector<ItemDrops::PendingDrop*>& drops)
+    {
+        if (api_url.empty()) return;
+
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto* drop : drops) {
+            auto* name_enc = ::GetItemName(drop->item_name_enc);
+            std::string item_name;
+            if (name_enc) {
+                item_name = TextUtils::WStringToString(name_enc->wstring());
+            }
+            std::string map_name;
+            if (auto* mn = Resources::GetMapName(drop->map_id)) {
+                map_name = TextUtils::WStringToString(mn->wstring());
+            }
+            std::string source_name;
+            if (drop->source_name_enc) {
+                if (auto* sn = ::GetItemName(drop->source_name_enc)) {
+                    source_name = TextUtils::WStringToString(sn->wstring());
+                }
+            }
+            arr.push_back({
+                {"system_time",           static_cast<int64_t>(drop->system_time)},
+                {"instance_time",         drop->instance_time},
+                {"map_name",              map_name},
+                {"item_name",             item_name},
+                {"source_name",           source_name},
+                {"quantity",              drop->quantity},
+                {"value",                 drop->value},
+                {"item_type",             static_cast<uint32_t>(drop->type)},
+                {"rarity",                static_cast<uint32_t>(drop->rarity)},
+                {"damage_type",           static_cast<uint32_t>(drop->damage_type)},
+                {"min_damage",            drop->min_damage},
+                {"max_damage",            drop->max_damage},
+                {"requirement_attribute", static_cast<uint32_t>(drop->requirement_attribute)},
+                {"requirement_value",     drop->requirement_value},
+                {"player_count",          drop->player_count},
+                {"hero_count",            drop->hero_count},
+                {"henchman_count",        drop->henchman_count},
+                {"hard_mode",             drop->hard_mode},
+                {"favor_active",          drop->favor_active},
+                {"model_file_id",         drop->model_file_id},
+            });
+        }
+
+        std::string payload = nlohmann::json{{"drops", arr}}.dump();
+
+        auto* req = new AsyncRestClient();
+        req->SetUrl(api_url.c_str());
+        req->SetMethod(HttpMethod::Post);
+        req->SetHeader("Content-Type", "application/json");
+        req->SetPostContent(payload.c_str(), payload.size(), ContentFlag::Copy);
+        req->SetTimeoutSec(10);
+        req->SetConnectTimeoutSec(5);
+        req->ExecuteAsync();
+        pending_api_requests.push_back(req);
+    }
+
+    void DrainCompletedApiRequests()
+    {
+        auto it = pending_api_requests.begin();
+        while (it != pending_api_requests.end()) {
+            AsyncRestClient* req = *it;
+            if (req->IsCompleted()) {
+                delete req;
+                it = pending_api_requests.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     void WritePendingDropsToFile(bool force = false) {
         if (pending_write_to_csv.empty() || (!force && TIMER_DIFF(last_drops_written) < 5000)) 
             return;
@@ -314,6 +402,18 @@ namespace {
             if (!item_name || item_name->IsDecoding()) {
                 all_decoded = false;
                 break;
+            }
+            auto* map_name = Resources::GetMapName(pending->map_id);
+            if (!map_name || map_name->IsDecoding()) {
+                all_decoded = false;
+                break;
+            }
+            if (pending->source_name_enc) {
+                auto* src_name = GetItemName(pending->source_name_enc);
+                if (!src_name || src_name->IsDecoding()) {
+                    all_decoded = false;
+                    break;
+                }
             }
         }
         if (!all_decoded) {
@@ -358,6 +458,7 @@ namespace {
             }
         }
 
+        PostDropsToApi(pending_write_to_csv);
         pending_write_to_csv.clear();
         my_file.flush();
         my_file.close();
@@ -367,6 +468,50 @@ namespace {
 
     bool ShouldTrackItem(GW::Item* item) {
         return track_drops && item && item->type != GW::Constants::ItemType::Bundle;
+    }
+
+    void ClearRecentSourceAgents()
+    {
+        for (auto& src : recent_source_agents) {
+            delete[] src.enc_name;
+        }
+        recent_source_agents.clear();
+    }
+
+    void PruneRecentSourceAgents()
+    {
+        auto it = recent_source_agents.begin();
+        while (it != recent_source_agents.end()) {
+            if (TIMER_DIFF(it->time) > 5000) {
+                delete[] it->enc_name;
+                it = recent_source_agents.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void OnInventorySlotCleared(GW::HookStatus*, GW::UI::UIMessage, void* wparam, void*)
+    {
+        if (!track_drops) return;
+        const auto p = static_cast<GW::UI::UIPacket::kInventorySlotUpdated*>(wparam);
+        if (p && p->item_id)
+            recently_player_dropped.insert(p->item_id);
+    }
+
+    void OnAgentState(GW::HookStatus*, GW::Packet::StoC::AgentState* packet)
+    {
+        if (!(packet->state & 16)) return; // bit 4 = dead
+        if (!track_drops) return;
+        auto* agent = GW::Agents::GetAgentByID(packet->agent_id);
+        if (!agent || !agent->GetIsLivingType()) return;
+        const wchar_t* enc = GW::Agents::GetAgentEncName(agent);
+        if (!enc || !*enc) return;
+        const auto len = wcslen(enc);
+        auto* enc_copy = new wchar_t[len + 1];
+        wcscpy(enc_copy, enc);
+        ::GetItemName(enc_copy)->wstring(); // trigger decode
+        recent_source_agents.push_back({agent->pos, enc_copy, TIMER_INIT()});
     }
 
     void OnAgentAdd(GW::HookStatus* status, const GW::Packet::StoC::AgentAdd* packet)
@@ -382,13 +527,54 @@ namespace {
         const auto can_pick_up = owner_id == 0                    // not reserved
                                  || owner_id == my_agent_id; // reserved for user
 
-        if (ShouldTrackItem(item)) {
+        const bool was_player_dropped = recently_player_dropped.erase(item->item_id) > 0;
+        if (ShouldTrackItem(item) && !was_player_dropped) {
             uint32_t hash = packet->agent_id;
             hash ^= static_cast<uint32_t>(packet->position.x * 1000.0f);
             hash ^= (static_cast<uint32_t>(packet->position.y * 1000.0f) << 16);
             if (hash && !already_seen_items.contains(hash)) {
                 already_seen_items[hash] = true;
                 auto drop = new ItemDrops::PendingDrop(item);
+                const float ix = packet->position.x;
+                const float iy = packet->position.y;
+                constexpr float kThreshold2 = 300.f * 300.f;
+                float best_dist2 = kThreshold2;
+                const wchar_t* best_enc = nullptr;
+
+                PruneRecentSourceAgents();
+                for (const auto& src : recent_source_agents) {
+                    const float dx = src.position.x - ix;
+                    const float dy = src.position.y - iy;
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 < best_dist2) {
+                        best_dist2 = d2;
+                        best_enc = src.enc_name;
+                    }
+                }
+                
+                if (const auto* agents = GW::Agents::GetAgentArray()) {
+                    for (const auto* agent : *agents) {
+                        if (!agent || !agent->GetIsGadgetType()) continue;
+                        const float dx = agent->pos.x - ix;
+                        const float dy = agent->pos.y - iy;
+                        const float d2 = dx * dx + dy * dy;
+                        if (d2 < best_dist2) {
+                            const wchar_t* enc = GW::Agents::GetAgentEncName(agent);
+                            if (enc && *enc) {
+                                best_dist2 = d2;
+                                best_enc = enc;
+                            }
+                        }
+                    }
+                }
+
+                if (best_enc) {
+                    const auto len = wcslen(best_enc);
+                    drop->source_name_enc = new wchar_t[len + 1];
+                    wcscpy(drop->source_name_enc, best_enc);
+                    ::GetItemName(drop->source_name_enc)->wstring();
+                }
+
                 drop_history.push_back(drop);
                 WriteDropToCSV(drop);
             }
@@ -420,6 +606,8 @@ namespace {
         already_seen_items.clear();
         suppressed_packets.clear();
         item_owners.clear();
+        recently_player_dropped.clear();
+        ClearRecentSourceAgents();
         ClearItemNames();
     }
 
@@ -469,12 +657,15 @@ namespace {
 void ItemDrops::Initialize()
 {
     ToolboxModule::Initialize();
+    InitAsyncRest();
 
     GW::StoC::RegisterPacketCallback<GW::Packet::StoC::AgentAdd>(&OnAgentAdd_Entry, OnAgentAdd);
     GW::StoC::RegisterPacketCallback<GW::Packet::StoC::AgentRemove>(&OnAgentRemove_Entry, OnAgentRemove);
     GW::StoC::RegisterPacketCallback<GW::Packet::StoC::MapLoaded>(&OnMapLoad_Entry, OnMapLoad);
     GW::StoC::RegisterPacketCallback<GW::Packet::StoC::ItemGeneral_ReuseID>(&OnItemReuseId_Entry, OnItemReuseId);
     GW::StoC::RegisterPacketCallback<GW::Packet::StoC::ItemUpdateOwner>(&OnItemUpdateOwner_Entry, OnItemUpdateOwner);
+    GW::StoC::RegisterPacketCallback<GW::Packet::StoC::AgentState>(&OnAgentState_Entry, OnAgentState);
+    GW::UI::RegisterUIMessageCallback(&OnInventorySlotCleared_Entry, GW::UI::UIMessage::kInventorySlotCleared, OnInventorySlotCleared);
 
     GW::Chat::CreateCommand(&ChatCmd_HookEntry, L"spawnblockeditems", [](GW::HookStatus*, const wchar_t*, int, const LPWSTR*) {
         SpawnSuppressedItems();
@@ -482,6 +673,7 @@ void ItemDrops::Initialize()
 }
 
 void ItemDrops::Update(float) {
+    DrainCompletedApiRequests();
     WritePendingDropsToFile();    
     if (!pending_full_exports.empty()) {
         for (auto pending : drop_history) {
@@ -521,8 +713,17 @@ void ItemDrops::SignalTerminate()
     GW::StoC::RemoveCallback<GW::Packet::StoC::MapLoaded>(&OnMapLoad_Entry);
     GW::StoC::RemoveCallback<GW::Packet::StoC::ItemGeneral_ReuseID>(&OnItemReuseId_Entry);
     GW::StoC::RemoveCallback<GW::Packet::StoC::ItemUpdateOwner>(&OnItemUpdateOwner_Entry);
+    GW::StoC::RemoveCallback<GW::Packet::StoC::AgentState>(&OnAgentState_Entry);
+    GW::UI::RemoveUIMessageCallback(&OnInventorySlotCleared_Entry);
 
     GW::Chat::DeleteCommand(&ChatCmd_HookEntry);
+    ClearRecentSourceAgents();
+    for (auto* req : pending_api_requests) {
+        req->Abort();
+        delete req;
+    }
+    pending_api_requests.clear();
+    ShutdownAsyncRest();
     ClearDropHistory();
     ClearItemNames();
 }
@@ -546,6 +747,7 @@ void ItemDrops::LoadSettings(ToolboxIni* ini)
     LOAD_BOOL(hide_party_gold);
     LOAD_BOOL(hide_party_green);
     LOAD_BOOL(track_drops);
+    api_url = ini->GetValue(Name(), "api_url", "");
 
     dont_hide_for_player = GuiUtils::IniToMap<decltype(dont_hide_for_player)>(ini, Name(), "dont_hide_for_player", default_dont_hide_for_player);
     dont_hide_for_party = GuiUtils::IniToMap<decltype(dont_hide_for_party)>(ini, Name(), "dont_hide_for_party", default_dont_hide_for_party);
@@ -565,6 +767,7 @@ void ItemDrops::SaveSettings(ToolboxIni* ini)
     SAVE_BOOL(hide_party_gold);
     SAVE_BOOL(hide_party_green);
     SAVE_BOOL(track_drops);
+    ini->SetValue(Name(), "api_url", api_url.c_str());
 
     GuiUtils::MapToIni(ini, Name(), "dont_hide_for_player", dont_hide_for_player);
     GuiUtils::MapToIni(ini, Name(), "dont_hide_for_party", dont_hide_for_party);
@@ -575,6 +778,14 @@ void ItemDrops::DrawSettingsInternal()
     ImGui::Text("Drop Tracking Settings");
     ImGui::Checkbox("Drop Tracking Enabled", &track_drops);
     ImGui::ShowHelp("This creates a CSV at DIRECTORY which contains all the information about drops you've gotten.");
+    {
+        char url_buf[512];
+        snprintf(url_buf, sizeof(url_buf), "%s", api_url.c_str());
+        if (ImGui::InputText("API URL", url_buf, sizeof(url_buf))) {
+            api_url = url_buf;
+        }
+        ImGui::ShowHelp("Optional URL to POST drop data as JSON. Leave empty to disable.");
+    }
     ImGui::Separator();
     ImGui::Text("Item Filter Settings");
     ImGui::NewLine();
@@ -739,6 +950,7 @@ ItemDrops::PendingDrop::PendingDrop(GW::Item* _item)
     hero_count = GW::PartyMgr::GetPartyHeroCount() & 0xf;
     henchman_count = GW::PartyMgr::GetPartyHenchmanCount() & 0xf;
     hard_mode = GW::PartyMgr::GetIsPartyInHardMode();
+    favor_active = FavorTracker::GetFavorMinutes() > 0;
     value = item->value;
     map_id = GW::Map::GetMapID();
     icon = Resources::GetItemImage(item);
@@ -778,14 +990,15 @@ ItemDrops::PendingDrop::PendingDrop(GW::Item* _item)
 
 ItemDrops::PendingDrop::~PendingDrop() {
     delete[] item_name_enc;
+    delete[] source_name_enc;
 }
 
 const wchar_t* ItemDrops::PendingDrop::GetCSVHeader()
 {
-    return L"SystemTime,InstanceTime,Map,ItemName,Quantity,Value,"
+    return L"SystemTime,InstanceTime,MapName,ItemName,SourceName,Quantity,Value,"
            L"ItemType,Rarity,DamageType,MinDamage,MaxDamage,"
            L"RequirementAttribute,RequirementValue,"
-           L"PlayerCount,HeroCount,HenchmanCount,HardMode,"
+           L"PlayerCount,HeroCount,HenchmanCount,HardMode,FavorActive,"
            L"ModelFileID";
 }
 
@@ -804,8 +1017,9 @@ const std::wstring ItemDrops::PendingDrop::toCSV()
     std::wstringstream ss;
     ss << system_time << L",";
     ss << instance_time << L",";
-    ss << (uint32_t)map_id << L",";
+    ss << TextUtils::SanitizeForCSV(Resources::GetMapName(map_id)->wstring()) << L",";
     ss << TextUtils::SanitizeForCSV(GetItemName()->wstring()) << L",";
+    ss << (source_name_enc ? TextUtils::SanitizeForCSV(::GetItemName(source_name_enc)->wstring()) : L"") << L",";
     ss << quantity << L",";
     ss << value << L",";
     ss << (uint32_t)type << L",";
@@ -819,6 +1033,7 @@ const std::wstring ItemDrops::PendingDrop::toCSV()
     ss << hero_count << L",";
     ss << henchman_count << L",";
     ss << (hard_mode ? L"1" : L"0") << L",";
+    ss << (favor_active ? L"1" : L"0") << L",";
     ss << model_file_id;
     return ss.str();
 }
